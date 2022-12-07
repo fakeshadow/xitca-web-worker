@@ -2,11 +2,12 @@ mod utils;
 
 use std::{cell::RefCell, rc::Rc};
 
+use serde_json::json;
 use worker::*;
 use xitca_http::{
     http,
     util::service::{
-        route::{get, RouteError},
+        route::{get, post, RouteError},
         router::{Router, RouterError},
     },
 };
@@ -43,6 +44,7 @@ pub async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     if R.with(|r| r.borrow().is_none()) {
         let service = Router::new()
             .insert("/", get(fn_service(index)))
+            .insert("/form/:field", post(fn_service(form)))
             .insert("/worker-version", get(fn_service(version)))
             .enclosed_fn(error_handler)
             .call(())
@@ -59,7 +61,8 @@ pub async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     let mut http_req = http::Request::new(());
 
     // naive url to uri conversion. only request path is covered.
-    *http_req.uri_mut() = req.url()
+    *http_req.uri_mut() = req
+        .url()
         .ok()
         .and_then(|url| std::str::FromStr::from_str(url.path()).ok())
         .unwrap_or_else(|| http::Uri::from_static("/not_found"));
@@ -93,7 +96,10 @@ where
         Ok(res) => Ok(res),
         Err(RouterError::First(_)) => Response::error("NotFound", 404),
         Err(RouterError::Second(RouteError::First(_))) => Response::error("MethodNotAllowed", 405),
-        Err(RouterError::Second(RouteError::Second(e))) => Err(e)
+        Err(RouterError::Second(RouteError::Second(e))) => {
+            console_log!("unhandled error: {e}");
+            Response::error("InternalServerError", 500)
+        }
     }
 }
 
@@ -101,7 +107,37 @@ async fn index(_: http::Request<()>) -> Result<Response> {
     Response::ok("Hello from Workers!")
 }
 
+async fn form(mut req: http::Request<()>) -> Result<Response> {
+    // extract path params from http::request.
+    let params = req.extensions_mut().remove::<http::Params>().unwrap();
+    // extract worker::Request from http::Request.
+    let mut req = req
+        .extensions_mut()
+        .remove::<FakeSync<FakeSend<Request>>>()
+        .unwrap()
+        .into_inner()
+        .into_inner();
+
+    let Some(name) = params.get("field") else {
+        return Response::error("BadRequest", 400)
+    };
+
+    let Ok(form) = req.form_data().await else {
+        return Response::error("BadRequest", 400)
+    };
+
+    let Some(entry) = form.get(name) else {
+        return Response::error("BadRequest", 400)
+    };
+
+    match entry {
+        FormEntry::Field(value) => Response::from_json(&json!({ name: value })),
+        FormEntry::File(_) => Response::error("`field` param in form shouldn't be a File", 422),
+    }
+}
+
 async fn version(mut req: http::Request<()>) -> Result<Response> {
+    // extract worker::Env from http::Request.
     let env = req
         .extensions_mut()
         .remove::<FakeSync<FakeSend<Env>>>()
